@@ -2,7 +2,7 @@
 
 > Trace one failed component to every affected unit—and contain it before the next spreadsheet opens.
 
-RecallRadar is a deterministic quality-lineage simulator built for the WebMCP OpenAI hackathon. A quality lead selects a failed supplier lot, watches an agent traverse explicit manufacturing relationships, compares containment scopes, and approves a reversible action set with full provenance.
+RecallRadar is a quality-lineage simulator built for the OpenAI WebMCP Challenge. A quality lead selects a failed supplier lot, watches an agent traverse explicit manufacturing relationships, compares containment scopes, and approves a reversible action set with full provenance. It runs deterministically with no external services and can optionally use Gemini for live model-selected WebMCP actions.
 
 Built by [HectorTa1989](https://github.com/HectorTa1989).
 
@@ -41,6 +41,25 @@ This gives the agent stable IDs, schemas, trust annotations, safe limits, idempo
 - Approve, commit, inspect the audit receipt, and undo all prior states.
 
 The hero scenario is fully local and deterministic. It requires no live ERP, warehouse, or messaging system.
+
+## Live Gemini agent and WebMCP execution
+
+An OpenAI API key is not required. When `GEMINI_API_KEY` is configured, RecallRadar calls Gemini from a server-only route using Google's Interactions API and function calling. Gemini chooses one tool from the tools currently valid for the visible evidence state; the browser then executes the same callback registered through `document.modelContext`.
+
+The model is the planner, not the authority:
+
+- The server offers only the tools allowed by the current lifecycle step.
+- RecallRadar binds tool arguments to visible stable IDs and the current graph version.
+- Supplier notes and tool output are explicitly treated as untrusted inert data.
+- Gemini pauses after staging so a human must click **Approve 271 inventory holds**.
+- The commit tool is unavailable until that click creates a stage-bound approval token.
+- Customer notices remain preview-only, and undo remains a separate explicit action.
+
+Without a Gemini key, **Run guided trace** uses the deterministic fallback through the same store actions. This preserves the brief's no-live-services demo requirement and provides a reliable judging fallback.
+
+To enable Gemini locally, copy `.env.example` to `.env.local`, add a key created in [Google AI Studio](https://aistudio.google.com/app/apikey), and restart the app. `GEMINI_MODEL` is configurable; the default is `gemini-3.7-flash`. Never expose the key through a `NEXT_PUBLIC_` variable or commit it to Git.
+
+The Challenge rules permit authorized third-party SDKs and APIs. Gemini is therefore compatible with the submission, while the project's judged centerpiece remains the browser's dynamic WebMCP lifecycle and human-agent approval boundary.
 
 ## Polar paywall and admin access
 
@@ -83,6 +102,7 @@ npm run test:e2e
 ```text
 RecallRadar/
 ├── app/
+│   ├── api/agent/turn/route.ts       # Server-only Gemini Interactions tool planner
 │   ├── api/billing/checkout/route.ts  # Polar checkout session endpoint
 │   ├── chatgpt-auth.ts                # Sites/ChatGPT identity helpers
 │   ├── globals.css                    # Apple-style design system and responsive UI
@@ -99,8 +119,10 @@ RecallRadar/
 │   ├── billing.ts                     # Polar customer-state and admin entitlements
 │   ├── domain.ts                      # Seed data, lineage, scope, hold, audit, inverse logic
 │   ├── store.ts                       # Investigation state machine and tool-call log
+│   ├── tool-catalog.ts                # Shared WebMCP/Gemini contracts and safe input binding
 │   └── utils.ts                       # Shared class helpers
 ├── tests/
+│   ├── agent-tools.test.ts             # Agent argument and contract safety tests
 │   ├── domain.test.ts                 # 14 deterministic unit/intent tests
 │   └── e2e/hero.spec.ts               # Hero, correction, untrusted-note, and undo flows
 ├── types/webmcp.d.ts                  # Current WebMCP draft type declarations

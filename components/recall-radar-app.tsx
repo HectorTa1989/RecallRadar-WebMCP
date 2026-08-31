@@ -11,17 +11,30 @@ import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { useWebMCP } from '@/hooks/use-webmcp';
+import { getWebMCPDefinitions, useWebMCP } from '@/hooks/use-webmcp';
 import type { AccountEntitlements } from '@/lib/billing';
 import {
   assemblyBatches, buildInclusionReason, customerOrders, evidenceRecords, finishedUnits, qualityEvents, shipments, supplierLots, warehouseStocks,
   type ContainmentScope,
 } from '@/lib/domain';
 import { getAvailableTools, useTraceStore } from '@/lib/store';
+import {
+  bindAgentToolInput,
+  type TraceToolName,
+} from '@/lib/tool-catalog';
 
 const BATCH_IDS = ['ASM-1042', 'ASM-1047', 'ASM-1051'];
 const wait = (milliseconds: number) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 const key = (prefix: string) => `${prefix}-${Date.now().toString(36)}`;
+const HERO_PROMPT = 'Trace CAP-77B to every affected finished unit. Find the narrowest defensible containment scope, show why each group is included, and stage the holds and customer-notice list for review.';
+
+type AgentConfig = { configured: boolean; model: string };
+type AgentHistoryEntry = { name: TraceToolName; result: string };
+type AgentStatus = 'idle' | 'running' | 'paused' | 'complete' | 'fallback' | 'error';
+type AgentTurnResponse =
+  | { type: 'tool_call'; name: TraceToolName; arguments?: Record<string, unknown>; model: string }
+  | { type: 'message'; message: string; model: string }
+  | { error: string; code?: string };
 
 const searchRecords = [
   ...supplierLots.map((lot) => ({ id: lot.id, type: 'Supplier lot', meta: lot.supplier })),
@@ -235,11 +248,19 @@ function AuditTimeline() {
   return <section id="audit" className="audit-card"><div className="panel-heading"><div><span className="panel-kicker">Reversible record</span><h3>Investigation timeline</h3></div><StatusPill tone="green">{auditEvents.length + toolLog.length} events</StatusPill></div><div className="audit-timeline">{auditEvents.map((event, index) => <div className="audit-item" key={event.id}><span className={index === auditEvents.length - 1 ? 'current' : ''}>{event.action.includes('undone') ? <RotateCcw size={12} /> : event.action.includes('committed') ? <PackageCheck size={12} /> : <Check size={12} />}</span><div><strong>{event.action}</strong><p>{event.detail}</p><small>{event.at.slice(11, 16)} · {event.actor} · {event.id}</small></div>{event.reversible && <StatusPill>Reversible</StatusPill>}</div>)}</div></section>;
 }
 
-export function RecallRadarApp({ account }: { account: AccountEntitlements }) {
+export function RecallRadarApp({ account, agent }: { account: AccountEntitlements; agent: AgentConfig }) {
   const state = useTraceStore();
   const [query, setQuery] = useState('CAP-77B');
   const [searchFocused, setSearchFocused] = useState(false);
   const [running, setRunning] = useState(false);
+  const [agentPrompt, setAgentPrompt] = useState(HERO_PROMPT);
+  const [agentStatus, setAgentStatus] = useState<AgentStatus>('idle');
+  const [agentMessage, setAgentMessage] = useState(agent.configured
+    ? 'Ready. Gemini will choose one currently registered WebMCP action at a time.'
+    : 'Gemini is not configured yet. The deterministic no-key demo remains available.');
+  const [agentHistory, setAgentHistory] = useState<AgentHistoryEntry[]>([]);
+  const [agentRunId, setAgentRunId] = useState('');
+  const [activeAgentTool, setActiveAgentTool] = useState<string | null>(null);
   useWebMCP(state.step);
 
   const results = useMemo(() => {
@@ -257,12 +278,94 @@ export function RecallRadarApp({ account }: { account: AccountEntitlements }) {
     else if (current.step === 5) current.previewScope('evidence', current.graphVersion);
   };
 
-  const runGuidedTrace = async () => {
+  const runFallbackTrace = async () => {
     if (!account.hasPremium) return state.requestPremium('the guided agent trace');
     setRunning(true);
+    setAgentStatus('fallback');
+    setAgentMessage('Running the deterministic, no-key trace. Every action still uses the same WebMCP execution callbacks.');
     if (useTraceStore.getState().step > 0) { useTraceStore.getState().resetInvestigation(); await wait(250); }
     for (let index = 0; index < 6; index += 1) { await performStep(); await wait(420); }
+    setAgentMessage('Deterministic trace complete: 312 affected units, 271 warehouse holds, and 41 shipped units across 18 notice previews.');
     setRunning(false);
+  };
+
+  const runGeminiTrace = async (resumeAfterApproval = false) => {
+    if (!account.hasPremium) return state.requestPremium('the live Gemini agent trace');
+    setRunning(true);
+    setAgentStatus('running');
+    setActiveAgentTool(null);
+
+    let history = resumeAfterApproval ? [...agentHistory] : [];
+    const runId = resumeAfterApproval && agentRunId ? agentRunId : Date.now().toString(36);
+    if (!resumeAfterApproval) {
+      setAgentHistory([]);
+      setAgentRunId(runId);
+      if (useTraceStore.getState().step > 0) {
+        useTraceStore.getState().resetInvestigation();
+        await wait(180);
+      }
+    }
+
+    setAgentMessage(resumeAfterApproval
+      ? 'Visible approval received. Gemini is evaluating the newly available commit tool.'
+      : 'Gemini is reading the visible graph and choosing its first scoped tool.');
+
+    try {
+      for (let iteration = 0; iteration < 14; iteration += 1) {
+        const current = useTraceStore.getState();
+        const response = await fetch('/api/agent/turn', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt: agentPrompt,
+            step: current.step,
+            graphVersion: current.graphVersion,
+            selectedNodeId: current.selectedNodeId,
+            approvalPresent: Boolean(current.approvalToken),
+            history,
+          }),
+        });
+        const turn = await response.json() as AgentTurnResponse;
+        if (!response.ok || 'error' in turn) {
+          throw new Error('error' in turn ? turn.error : 'Gemini request failed.');
+        }
+
+        if (turn.type === 'message') {
+          setAgentMessage(turn.message);
+          setAgentStatus(current.step === 7 ? 'paused' : 'complete');
+          break;
+        }
+
+        const definition = getWebMCPDefinitions(current.step).find((tool) => tool.name === turn.name);
+        if (!definition) throw new Error(`Tool ${turn.name} is no longer available for graph v${current.graphVersion}.`);
+        const boundInput = bindAgentToolInput(turn.name, {
+          graphVersion: current.graphVersion,
+          selectedLotId: current.selectedLotId,
+          stagedHoldId: current.stagedHold?.id,
+          approvalToken: current.approvalToken ?? undefined,
+          auditEventId: current.inverseAction?.auditEventId,
+          runId,
+        });
+        setActiveAgentTool(turn.name);
+        setAgentMessage(`Gemini selected ${turn.name}. Applying it to graph v${current.graphVersion}…`);
+        const rawResult = await definition.execute(boundInput);
+        const result = typeof rawResult === 'string' ? rawResult : JSON.stringify(rawResult);
+        history = [...history, { name: turn.name, result: result.slice(0, 2_000) }];
+        setAgentHistory(history);
+        await wait(180);
+      }
+    } catch (error) {
+      setAgentStatus('error');
+      setAgentMessage(`${error instanceof Error ? error.message : 'Gemini trace failed.'} You can continue with the manual controls or use the deterministic demo.`);
+    } finally {
+      setActiveAgentTool(null);
+      setRunning(false);
+    }
+  };
+
+  const runGuidedTrace = () => {
+    if (!agent.configured) return runFallbackTrace();
+    return runGeminiTrace(state.step === 8 && Boolean(state.approvalToken));
   };
 
   const selectedScope = state.scopes.find((scope) => scope.id === state.selectedScopeId);
@@ -271,7 +374,8 @@ export function RecallRadarApp({ account }: { account: AccountEntitlements }) {
   return <main className="app-root">
     <header className="app-header"><BrandMark /><div className="brand-copy"><strong>RecallRadar</strong><span>Quality intelligence</span></div><nav aria-label="Primary navigation" className="top-nav"><a className="active" href="#investigate">Investigate</a><a href="#events">Quality events</a><a href="#audit">Audit</a></nav><div className="header-actions"><button className="webmcp-button" onClick={() => state.setDeveloperDrawerOpen(true)}><Code2 size={14} /><span>WebMCP</span><i>{getAvailableTools(state.step).length}</i></button><button className="icon-button" aria-label="Open command menu" onClick={() => setSearchFocused(true)}><Command size={16} /></button><button className="account-chip" onClick={() => account.isAdmin ? undefined : state.requestPremium('all Pro features')}><span>{account.displayName.split(' ').map((part) => part[0]).join('').slice(0,2)}</span><div><strong>{account.displayName}</strong><small>{account.tier === 'admin' ? 'Admin · All access' : account.tier === 'pro' ? 'Pro via Polar' : 'Free plan'}</small></div><ChevronDown size={14} /></button></div></header>
     <section id="investigate" className="workspace-shell"><aside className="sidebar"><div className="side-label">Workspace</div><button className="side-item active"><GitBranch size={16} />Investigation<span>1</span></button><button className="side-item"><BellRing size={16} />Quality events<span>3</span></button><button className="side-item"><Boxes size={16} />Trace records</button><button className="side-item"><ShieldCheck size={16} />Containment</button><div id="events" className="side-label spaced">Seeded events</div>{qualityEvents.map((event) => <button className={`event-mini-card ${event.id === 'QE-2026-014' ? 'active' : ''}`} key={event.id}><div><span className={`status-dot ${event.severity}`} />{event.id}</div><strong>{event.title}</strong><small>{event.selectedLotId} · {event.severity}</small></button>)}<div className="sidebar-foot"><div className="polar-badge"><Sparkles size={15} /><span><strong>{account.isAdmin ? 'Admin access' : account.hasPremium ? 'Polar entitlement' : 'Free workspace'}</strong><small>{account.hasPremium ? 'All Pro tools enabled' : 'Upgrade for containment tools'}</small></span></div></div></aside>
-      <div className="main-workspace"><div className="title-row"><div><div className="eyebrow"><span className="live-dot" />LIVE INVESTIGATION · QE-2026-014</div><h1>Trace a failed component</h1><p>Follow every affected path, resolve the evidence, then contain the exact scope.</p></div><div className="title-actions"><Button variant="outline" className="rounded-full bg-white" onClick={() => state.selectNode('EV-ASM-1051')}><FileCheck2 size={14} /> Source records</Button><Button className="rounded-full bg-zinc-900 text-white" onClick={runGuidedTrace} disabled={running}>{running ? <RefreshCw className="spin" size={14} /> : <Zap size={14} />}{running ? 'Tracing evidence…' : 'Run guided trace'}</Button></div></div>
+      <div className="main-workspace"><div className="title-row"><div><div className="eyebrow"><span className="live-dot" />LIVE INVESTIGATION · QE-2026-014</div><h1>Trace a failed component</h1><p>Follow every affected path, resolve the evidence, then contain the exact scope.</p></div><div className="title-actions"><Button variant="outline" className="rounded-full bg-white" onClick={() => state.selectNode('EV-ASM-1051')}><FileCheck2 size={14} /> Source records</Button><Button className="rounded-full bg-zinc-900 text-white" onClick={runGuidedTrace} disabled={running}>{running ? <RefreshCw className="spin" size={14} /> : <Zap size={14} />}{running ? (agent.configured ? 'Gemini reasoning…' : 'Tracing evidence…') : state.step === 8 && agent.configured ? 'Continue Gemini commit' : agent.configured ? 'Run Gemini trace' : 'Run guided trace'}</Button></div></div>
+        <section className={`agent-console ${agentStatus}`} aria-label="Agent command center"><div className="agent-orb"><Sparkles size={17} /></div><div className="agent-command-copy"><div className="agent-command-head"><strong>{agent.configured ? `Gemini live agent · ${agent.model}` : 'Deterministic fallback'}</strong><StatusPill tone={agentStatus === 'error' ? 'red' : agentStatus === 'complete' ? 'green' : agentStatus === 'paused' ? 'amber' : agent.configured ? 'blue' : 'neutral'}>{agentStatus === 'running' ? 'Reasoning' : agentStatus === 'paused' ? 'Human approval' : agentStatus === 'complete' ? 'Complete' : agentStatus === 'error' ? 'Needs attention' : agent.configured ? 'Live API' : 'No key'}</StatusPill></div><textarea aria-label="Agent investigation prompt" value={agentPrompt} onChange={(event) => setAgentPrompt(event.target.value)} maxLength={2000} disabled={running} /><p>{agentMessage}</p></div><div className="agent-runtime"><span className={agent.configured ? 'live' : ''} /><small>{activeAgentTool ? <code>{activeAgentTool}</code> : agent.configured ? 'Server-side key' : 'Local simulator'}</small><strong>{agentHistory.length} calls</strong></div></section>
         <div className="search-wrap"><div className={`search-panel ${searchFocused ? 'focused' : ''}`}><Search size={18} /><input aria-label="Search trace records" value={query} onChange={(event) => setQuery(event.target.value)} onFocus={() => setSearchFocused(true)} /><span>{results[0]?.type ?? 'Trace record'}</span><kbd>⌘ K</kbd></div>{searchFocused && <div className="search-results"><div className="search-result-head"><span>Trace records</span><button onClick={() => setSearchFocused(false)}><X size={13} /></button></div>{results.map((record) => <button key={record.id} onClick={() => { state.selectNode(record.id); setQuery(record.id); setSearchFocused(false); }}><span className="result-icon">{record.type === 'Warehouse' ? <Warehouse size={14} /> : record.type === 'Shipment' ? <Truck size={14} /> : record.type === 'Order' ? <ReceiptText size={14} /> : <Boxes size={14} />}</span><span><strong>{record.id}</strong><small>{record.type} · {record.meta}</small></span><CornerDownRight size={13} /></button>)}</div>}</div>
         <div className="metrics-strip"><div><span>Selected supplier lot</span><strong>CAP-77B</strong><small className="danger">Test failed</small></div><div><span>Affected units</span><strong>{state.step >= 2 ? '312' : '—'}</strong><small>{state.step >= 2 ? 'Across 3 batches' : 'Awaiting traversal'}</small></div><div><span>Warehouse stock</span><strong>{state.step >= 3 ? '271' : '—'}</strong><small className={state.step >= 6 ? 'amber' : ''}>{state.step >= 9 ? 'Committed hold' : state.step >= 6 ? 'Ready to stage' : 'Not resolved'}</small></div><div><span>Shipped units</span><strong>{state.step >= 3 ? '41' : '—'}</strong><small>{state.step >= 3 ? '18 notice previews' : 'Not resolved'}</small></div></div>
         <section className="graph-card"><div className="card-heading"><div><h2>Lineage map</h2><p>Graph v{state.graphVersion} · {state.step >= 4 ? 'corrected evidence resolved' : 'incremental traversal'}</p></div><div className="graph-controls"><div className="legend"><span><i className="amber-dot" />Affected</span><span><i />Unresolved</span>{state.step >= 9 && <span><i className="green-dot" />Held</span>}</div><button onClick={state.resetInvestigation}><RotateCcw size={12} /> Reset</button></div></div><LineageGraph /><div className="graph-footer"><div className="lifecycle-progress">{['Lot','Batches','Units','Locations','Evidence','Scope'].map((label,index) => <span className={state.step >= index ? 'complete' : ''} key={label}><i>{state.step > index ? <Check size={9} /> : index + 1}</i>{label}</span>)}</div>{state.step <= 5 && <Button size="sm" onClick={performStep} disabled={running}>{nextLabels[state.step]}<ArrowRight size={13} /></Button>}{state.step >= 6 && selectedScope && <StatusPill tone="amber">Previewing {selectedScope.label}</StatusPill>}</div></section>
