@@ -39,3 +39,11 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# IDE and AI tool directories
+.devin/
+#.openai/
+
+# demo and evaluation files
+/demo/
+#/evals/
